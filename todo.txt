@@ -1,0 +1,3 @@
+Replace the libft functions with ones from cleaner repo since mine used to have gc_malloc instead of malloc
+
+Fixed the tab issues

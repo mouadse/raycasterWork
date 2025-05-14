@@ -1,0 +1,275 @@
+#include "raycaster.h"
+
+void fatal(const char *msg)
+{
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+size_t ft_strlen(const char *s) {
+    return s ? strlen(s) : 0;
+}
+
+void ft_put_str(const char *s)
+{
+	if (s) write(2, s, ft_strlen(s));
+}
+
+char *ft_strdup(const char *s)
+{
+    size_t len = ft_strlen(s);
+    char *dup = malloc(len + 1);
+    if (!dup) fatal("malloc");
+    memcpy(dup, s, len + 1);
+    return dup;
+}
+
+char *ft_strjoin(const char *a, const char *b)
+{
+    size_t la = ft_strlen(a);
+    size_t lb = ft_strlen(b);
+    char *s = malloc(la + lb + 1);
+    if (!s) fatal("malloc");
+    memcpy(s, a, la);
+    memcpy(s + la, b, lb + 1);
+    return s;
+}
+
+char *ft_itoa(int n)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", n);
+    return ft_strdup(buf);
+}
+
+static inline t_vector v_new(float x, float y) { return (t_vector){x, y}; }
+static inline t_vector v_add(t_vector a, t_vector b) { return v_new(a.x + b.x, a.y + b.y); }
+static inline t_vector v_mul(t_vector v, float k) { return v_new(v.x * k, v.y * k); }
+static inline t_vector v_rot(t_vector v, float deg)
+{
+    float rad = deg * (float)M_PI / 180.f;
+    float cs = cosf(rad), sn = sinf(rad);
+    return v_new(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
+}
+
+static char *g_map[] = {
+	"111111111",
+	"1N0000001",
+	"101110110",
+	"100010001",
+	"111011101",
+	"100000001",
+	"111111111",
+	NULL
+};
+static const int  g_map_rows = 7;
+static const int  g_map_cols = 9;
+
+uint32_t get_tex_pixel(mlx_texture_t *tex, int y, int x)
+{
+    if (!tex) return 0xFF00FFFF;
+    if (x < 0 || y < 0 || x >= (int)tex->width || y >= (int)tex->height)
+        return 0xFFFFFFFF;
+    size_t idx = (y * tex->width + x) * tex->bytes_per_pixel;
+    uint8_t *p = &tex->pixels[idx];
+    return (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3];
+}
+
+uint32_t set_wall_colour(int side, int stepX, int stepY)
+{
+    if (side == 0)
+        return stepX < 0 ? 0xFF4444FF : 0xFF8888FF;
+    else
+        return stepY < 0 ? 0xFF44FF44 : 0xFF88FF88;
+}
+
+void key_press(mlx_key_data_t k, void *p)
+{
+    t_game *g = p;
+    bool v = k.action != MLX_RELEASE;
+    if (k.key == MLX_KEY_W)      g->keys.w     = v;
+    if (k.key == MLX_KEY_S)      g->keys.s     = v;
+    if (k.key == MLX_KEY_A)      g->keys.a     = v;
+    if (k.key == MLX_KEY_D)      g->keys.d     = v;
+    if (k.key == MLX_KEY_LEFT)   g->keys.left  = v;
+    if (k.key == MLX_KEY_RIGHT)  g->keys.right = v;
+    if (k.key == MLX_KEY_ESCAPE && v)          mlx_close_window(g->mlx);
+}
+
+bool map_is_wall(int x, int y) {
+    return (x < 0 || y < 0 || y >= g_map_rows || x >= g_map_cols || g_map[y][x]=='1');
+}
+
+void handle_movement(t_game *g)
+{
+    const float mv = g->frame_time * 4.0f;
+    const float rt = g->frame_time * 140.0f;
+
+    t_vector new = g->pos;
+    if (g->keys.w) { new.x += g->dir.x*mv; new.y += g->dir.y*mv; }
+    if (g->keys.s) { new.x -= g->dir.x*mv; new.y -= g->dir.y*mv; }
+    if (g->keys.a) { new.x -= g->plane.x*mv; new.y -= g->plane.y*mv; }
+    if (g->keys.d) { new.x += g->plane.x*mv; new.y += g->plane.y*mv; }
+    if (!map_is_wall((int)new.x, (int)g->pos.y)) g->pos.x = new.x;
+    if (!map_is_wall((int)g->pos.x, (int)new.y)) g->pos.y = new.y;
+
+    if (g->keys.left)  { g->dir = v_rot(g->dir,-rt); g->plane = v_rot(g->plane,-rt); ft_put_str("Rotation: -"); ft_put_str(ft_itoa((int)rt)); ft_put_str(" deg\n"); }
+    if (g->keys.right) { g->dir = v_rot(g->dir, rt); g->plane = v_rot(g->plane, rt); ft_put_str("Rotation: "); ft_put_str(ft_itoa((int)rt)); ft_put_str(" deg\n"); }
+}
+
+int signf(float v){ return v<0?-1:1; }
+
+void draw_column(t_game *g, int x, t_dda *r)
+{
+    t_wall w;
+    w.height   = (int)(HEIGHT / r->perp_dist);
+    w.start_y  = -w.height/2 + HEIGHT/2; if (w.start_y<0) w.start_y=0;
+    w.end_y    =  w.height/2 + HEIGHT/2; if (w.end_y>=HEIGHT) w.end_y=HEIGHT-1;
+
+    int side = r->hit_side;
+    int tidx;
+    if (side==0) tidx = r->step.x<0?2:3; else tidx = r->step.y<0?0:1;
+    mlx_texture_t *tex = g->tex[tidx];
+
+    if (tex)
+    {
+        float wall_x = (side==0) ? (g->pos.y + r->perp_dist*r->dir.y)
+                                 : (g->pos.x + r->perp_dist*r->dir.x);
+        wall_x -= floorf(wall_x);
+        w.tex_x = (int)(wall_x * tex->width);
+        if ((side==0 && r->dir.x>0) || (side==1 && r->dir.y<0))
+            w.tex_x = tex->width - w.tex_x - 1;
+        w.tex_step = (float)tex->height / w.height;
+        w.tex_pos  = (w.start_y - (float)HEIGHT/2.0f + (float)w.height/2.0f) * w.tex_step;
+
+        for (int y=w.start_y; y<=w.end_y; ++y)
+        {
+            int tex_y = (int)w.tex_pos & (tex->height-1);
+            w.tex_pos += w.tex_step;
+            uint32_t c = get_tex_pixel(tex, tex_y, w.tex_x);
+            mlx_put_pixel(g->img, x, y, c);
+        }
+    }
+    else
+    {
+        uint32_t flat = set_wall_colour(side,r->step.x,r->step.y);
+        for (int y=w.start_y; y<=w.end_y; ++y)
+            mlx_put_pixel(g->img, x, y, flat);
+    }
+}
+
+void render(t_game *g)
+{
+    uint32_t ceil_c = 0xFF777777;
+    uint32_t floor_c= 0xFF333333;
+    for (int y=0;y<HEIGHT/2;++y)    for (int x=0;x<WIDTH;++x) mlx_put_pixel(g->img,x,y,ceil_c);
+    for (int y=HEIGHT/2;y<HEIGHT;++y)for (int x=0;x<WIDTH;++x) mlx_put_pixel(g->img,x,y,floor_c);
+
+    for (int x=0; x<WIDTH; ++x)
+    {
+        t_dda r;
+        r.plane_multiplier = 2.f*x/(float)WIDTH - 1.f;
+        r.camera_pixel     = v_mul(g->plane, r.plane_multiplier);
+        r.dir              = v_add(g->dir, r.camera_pixel);
+
+        r.map.x = (int)g->pos.x;
+        r.map.y = (int)g->pos.y;
+
+        r.delta_dist.x = r.dir.x==0 ? 1e30f : fabsf(1.f/r.dir.x);
+        r.delta_dist.y = r.dir.y==0 ? 1e30f : fabsf(1.f/r.dir.y);
+
+        r.step.x = signf(r.dir.x);
+        r.step.y = signf(r.dir.y);
+        if (r.dir.x < 0)
+            r.dist_side.x = (g->pos.x - r.map.x) * r.delta_dist.x;
+        else
+            r.dist_side.x = (r.map.x + 1.f - g->pos.x)* r.delta_dist.x;
+        if (r.dir.y < 0)
+            r.dist_side.y = (g->pos.y - r.map.y) * r.delta_dist.y;
+        else
+            r.dist_side.y = (r.map.y + 1.f - g->pos.y)* r.delta_dist.y;
+
+        while (!map_is_wall(r.map.x, r.map.y))
+        {
+            if (r.dist_side.x < r.dist_side.y)
+            {
+                r.dist_side.x += r.delta_dist.x; r.map.x += r.step.x; r.hit_side = 0;
+            }
+            else
+            {
+                r.dist_side.y += r.delta_dist.y; r.map.y += r.step.y; r.hit_side = 1;
+            }
+        }
+        r.perp_dist = (r.hit_side==0) ? (r.dist_side.x - r.delta_dist.x)
+                                      : (r.dist_side.y - r.delta_dist.y);
+        if (r.perp_dist<=0.f) r.perp_dist = 0.01f;
+        // Log ray distance for this column
+        ft_put_str("Column "); ft_put_str(ft_itoa(x)); ft_put_str(": distance "); ft_put_str(ft_itoa((int)(r.perp_dist * 1000))); ft_put_str("\n");
+        draw_column(g, x, &r);
+    }
+}
+
+void loop_hook(void *param)
+{
+    t_game *g = param;
+    g->frame_time = g->mlx->delta_time;
+    handle_movement(g);
+    render(g);
+}
+
+void load_textures(t_game *g)
+{
+    const char *paths[4] = {TEX_NORTH,TEX_SOUTH,TEX_WEST,TEX_EAST};
+    for (int i=0;i<4;++i)
+    {
+         if (access(paths[i], R_OK)==0)
+         {
+             g->tex[i] = mlx_load_png(paths[i]);
+         }
+         else
+         {
+             g->tex[i] = NULL;
+         }
+    }
+}
+
+void find_player_start(t_game *g)
+{
+    for (int y=0; g_map[y]; ++y)
+        for (int x=0; g_map[y][x]; ++x)
+        {
+            char c = g_map[y][x];
+            if (c=='N'||c=='S'||c=='E'||c=='W') {
+                g->pos = v_new(x + 0.5f, y + 0.5f);
+                if (c=='N'){ g->dir=v_new( 0,-1); g->plane=v_new( 0.66, 0); /*ft_put_str("Direction: North\n");*/ }
+                if (c=='S'){ g->dir=v_new( 0, 1); g->plane=v_new(-0.66,0); /*ft_put_str("Direction: South\n");*/ }
+                if (c=='W'){ g->dir=v_new(-1, 0); g->plane=v_new(0, -0.66); /*ft_put_str("Direction: West\n");*/ }
+                if (c=='E'){ g->dir=v_new( 1, 0); g->plane=v_new(0,  0.66); /*ft_put_str("Direction: East\n");*/ }
+                return;
+            }
+        }
+    fatal("No player start found in map");
+}
+
+int main(void)
+{
+    t_game g = {0};
+
+    g.mlx = mlx_init(WIDTH, HEIGHT, "DDA Raycaster", false);
+    if (!g.mlx) fatal("mlx_init");
+
+    g.img = mlx_new_image(g.mlx, WIDTH, HEIGHT);
+    if (!g.img) fatal("mlx_new_image");
+    mlx_image_to_window(g.mlx, g.img, 0, 0);
+
+    load_textures(&g);
+    find_player_start(&g);
+    mlx_key_hook(g.mlx, key_press, &g);
+    mlx_loop_hook(g.mlx, loop_hook, &g);
+    mlx_loop(g.mlx);
+
+    for (int i=0;i<4;++i) if (g.tex[i]) mlx_delete_texture(g.tex[i]);
+    mlx_delete_image(g.mlx, g.img);
+    mlx_terminate(g.mlx);
+    return 0;
+}
